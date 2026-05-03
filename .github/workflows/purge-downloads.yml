@@ -1,4 +1,4 @@
-name: بازسازی و پاکسازی پوشه downloads
+name: حذف قطعی پوشه downloads
 
 on:
   workflow_dispatch:
@@ -7,27 +7,60 @@ permissions:
   contents: write
 
 jobs:
-  fix-downloads:
+  delete-downloads:
     runs-on: ubuntu-latest
-
     steps:
-      - name: دریافت کل ریپازیتوری
-        uses: actions/checkout@v4
-
-      - name: بازسازی پوشه downloads
+      - name: حذف بازگشتی تمام محتویات downloads
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # پوشه رو با یه فایل .gitkeep بساز
-          mkdir -p downloads
-          touch downloads/.gitkeep
-          echo "✅ پوشه downloads با فایل .gitkeep ساخته شد"
+          echo "🔍 شروع حذف بازگشتی..."
 
-      - name: Commit و Push
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # تابع حذف یک مسیر
+          delete_path() {
+            local path="$1"
+            echo "📁 بررسی: $path"
+            
+            # دریافت اطلاعات مسیر
+            local response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/contents/$path?ref=main")
+            
+            # اگر آرایه است (پوشه)
+            if echo "$response" | jq -e 'type == "array"' > /dev/null 2>&1; then
+              echo "📂 پوشه: $path (حاوی $(echo "$response" | jq 'length') آیتم)"
+              echo "$response" | jq -c '.[]' | while IFS= read -r item; do
+                sub_path=$(echo "$item" | jq -r '.path')
+                item_type=$(echo "$item" | jq -r '.type')
+                if [ "$item_type" = "dir" ]; then
+                  delete_path "$sub_path"
+                else
+                  delete_file "$sub_path"
+                fi
+              done
+            else
+              # یک فایل است
+              delete_file "$path"
+            fi
+          }
+
+          # تابع حذف یک فایل
+          delete_file() {
+            local file_path="$1"
+            local file_sha=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/contents/$file_path?ref=main" | jq -r '.sha')
+            
+            if [ -n "$file_sha" ] && [ "$file_sha" != "null" ]; then
+              echo "🗑️ حذف: $file_path"
+              curl -s -X DELETE -H "Authorization: token $GITHUB_TOKEN" \
+                -d "{\"message\":\"حذف $file_path\",\"sha\":\"$file_sha\",\"branch\":\"main\"}" \
+                "https://api.github.com/repos/${{ github.repository }}/contents/$file_path" > /dev/null
+              echo "✅"
+            else
+              echo "⚠️ یافت نشد: $file_path"
+            fi
+          }
+
+          # شروع از پوشه downloads
+          delete_path "downloads"
           
-          git add downloads/
-          git commit -m "📁 بازسازی پوشه downloads"
-          git push
-          
-          echo "🎉 پوشه downloads برگشت!"
+          echo "🎉 عملیات حذف به پایان رسید!"
