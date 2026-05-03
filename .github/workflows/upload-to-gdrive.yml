@@ -1,56 +1,108 @@
-name: تست آپلود - با action جدید
+name: آپلود هوشمند، مرتب و تضمینی
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: read
+    inputs:
+      folder_name:
+        description: 'نام پوشه'
+        required: true
+      group_number:
+        description: 'شماره گروه ۱۴ گیگابایتی'
+        required: true
+        default: '1'
 
 jobs:
-  test-upload:
+  transfer:
     runs-on: ubuntu-latest
-
     steps:
-      - name: دریافت فقط پوشه مورد نظر
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            downloads/batch_20260428_202253_7
-          sparse-checkout-cone-mode: false
-
-      - name: بررسی پوشه
+      - name: نصب Rclone، jq و parallel
         run: |
-          echo "========== محتویات پوشه =========="
-          ls -lhR downloads/batch_20260428_202253_7/
-          TOTAL_SIZE=$(du -sh downloads/batch_20260428_202253_7/ | cut -f1)
-          echo "📊 حجم: $TOTAL_SIZE"
+          curl https://rclone.org/install.sh | sudo bash
+          sudo apt-get update && sudo apt-get install -y jq parallel
 
-      - name: ساخت ZIP
+      - name: تنظیم کانفیگ Rclone
         run: |
-          TIMESTAMP=$(date +'%Y%m%d_%H%M%S')
-          ZIP_NAME="test_new_action_${TIMESTAMP}.zip"
+          mkdir -p ~/.config/rclone/
+          echo "${{ secrets.RCLONE_CONFIG_BASE64 }}" | base64 -d > ~/.config/rclone/rclone.conf
+
+      - name: گروه‌بندی مرتب و آپلود
+        run: |
+          FOLDER="${{ github.event.inputs.folder_name }}"
+          GROUP_NUM="${{ github.event.inputs.group_number }}"
+          MAX_SIZE=$((14 * 1024 * 1024 * 1024))
+          WORK_DIR="download_temp"
+          TAR_FILE="${FOLDER}_group_${GROUP_NUM}.tar"
           
-          echo "📦 در حال فشرده‌سازی..."
-          zip -r "${ZIP_NAME}" downloads/batch_20260428_202253_7/ > /dev/null 2>&1
+          mkdir -p "$WORK_DIR/$FOLDER"
           
-          ZIP_SIZE=$(du -h "$ZIP_NAME" | cut -f1)
-          echo "✅ فایل ZIP: $ZIP_NAME ($ZIP_SIZE)"
-          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+          echo "📋 دریافت لیست فایل‌ها..."
+          FILES=$(curl -s "https://api.github.com/repos/kmirsamie-del/github-file-downloader/contents/downloads/$FOLDER?ref=main")
 
-      - name: آپلود به Google Drive
-        uses: adityak74/google-drive-upload-git-action@main
-        with:
-          credentials: ${{ secrets.GDRIVE_CREDENTIALS }}
-          filename: ${{ env.ZIP_NAME }}
-          folderId: ${{ secrets.GDRIVE_FOLDER_ID }}
-          name: ${{ env.ZIP_NAME }}
-          overwrite: true
+          # --- گروه‌بندی خانواده‌ها ---
+          echo "🧠 گروه‌بندی فایل‌ها بر اساس خانواده (base name)..."
+          
+          declare -A FAMILIES
+          declare -A FAMILY_SIZE
+          
+          while IFS= read -r line; do
+            URL=$(echo "$line" | awk '{print $1}')
+            NAME=$(echo "$line" | awk '{print $2}')
+            SIZE=$(echo "$line" | awk '{print $3}')
+            
+            BASE_NAME=$(echo "$NAME" | sed 's/\(.*\)\.7z\..*/\1/')
+            FAMILIES["$BASE_NAME"]+="$URL $NAME"$'\n'
+            FAMILY_SIZE["$BASE_NAME"]=$(( ${FAMILY_SIZE["$BASE_NAME"]} + SIZE ))
+          done < <(echo "$FILES" | jq -r '.[] | "\(.download_url) \(.name) \(.size)"')
 
-      - name: گزارش نهایی
-        run: |
-          echo ""
-          echo "═════════════════════════════════════════════"
-          echo "🎉 تست آپلود انجام شد!"
-          echo "📁 فایل: ${{ env.ZIP_NAME }}"
-          echo "☁️  مقصد: Google Drive"
-          echo "═════════════════════════════════════════════"
+          # *** بخش جدید: مرتب‌سازی خانواده‌ها ***
+          echo "📑 مرتب‌سازی خانواده‌ها بر اساس شماره..."
+          SORTED_BASES=$(for base in "${!FAMILY_SIZE[@]}"; do echo "$base"; done | sort -t '_' -k2 -n)
+          # -t '_': جداکننده "_" است (مثلاً file_01)
+          # -k2 -n: مرتب‌سازی بر اساس قسمت دوم (عدد) به صورت عددی
+
+          CURRENT_SIZE=0
+          CURRENT_GROUP=1
+          > "group_${GROUP_NUM}.txt"
+          
+          for BASE in $SORTED_BASES; do
+            FSIZE=${FAMILY_SIZE["$BASE"]}
+            
+            if [ $((CURRENT_SIZE + FSIZE)) -gt $MAX_SIZE ] && [ $CURRENT_SIZE -gt 0 ]; then
+              CURRENT_GROUP=$((CURRENT_GROUP + 1))
+              CURRENT_SIZE=0
+            fi
+            
+            if [ $CURRENT_GROUP -eq $GROUP_NUM ]; then
+              echo "${FAMILIES[$BASE]}" >> "group_${GROUP_NUM}.txt"
+            fi
+            
+            CURRENT_SIZE=$((CURRENT_SIZE + FSIZE))
+          done
+
+          sed -i '/^$/d' "group_${GROUP_NUM}.txt"
+
+          if [ ! -s "group_${GROUP_NUM}.txt" ]; then
+            echo "❌ گروه شماره $GROUP_NUM خالی است."
+            exit 1
+          fi
+
+          # دانلود و ادامه...
+          echo "⚡ دانلود فایل‌های گروه $GROUP_NUM (مرتب)..."
+          cat "group_${GROUP_NUM}.txt" | parallel --colsep ' ' -j 8 'curl -s -L -o "'$WORK_DIR'/'$FOLDER'/{2}" {1} && echo "✅ {2}"'
+          
+          echo "📦 ساخت فایل TAR..."
+          cd "$WORK_DIR"
+          tar -cf "../$TAR_FILE" "$FOLDER"
+          cd ..
+          
+          echo "📊 حجم فایل: $(du -h $TAR_FILE | cut -f1)"
+          
+          echo "🚀 آپلود به گوگل درایو..."
+          rclone copy "$TAR_FILE" "gdrive:/test_downloads/${FOLDER}/" --progress --verbose --transfers 8 --buffer-size 128M
+          
+          if [ $? -eq 0 ]; then
+            echo "🎉 گروه $GROUP_NUM آپلود شد."
+          else
+            echo "❌ خطا در آپلود."
+            exit 1
+          fi
